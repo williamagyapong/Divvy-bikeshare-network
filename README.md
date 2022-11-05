@@ -8,7 +8,7 @@ data population. Bike share users in chicago use bike share for both one-way tri
 but mostly one-way trips, and throughout the weekdays and on weekends, with casual users making
 more rides on weekends than on weekdays and vice versa for members. The analysis revealed that
 the Streeter Dr & Grand Avenue bike station is the most central station, while the State St & 95th
-St station appeared to be the most critical to information flow in the bike-share network. there were
+St station appeared to be the most critical to information flow in the bike-share network. There were
 many Divvy bike-share stations with low usage of public bikes. The bike-share network can be thought
 of as involving one big giant component which suggests that similar strategies can be adopted to bring
 improvement in ridership across all or most of the stations.
