@@ -1,0 +1,1295 @@
+---
+title: "Exploring the Divvy (Chicago) Bike Sharing System Network"
+author: "William O. Agyapong"
+date: \center University of Texas, El Paso (UTEP), Department of Mathematical Sciences
+  \center
+output:
+  pdf_document:
+    latex_engine: xelatex
+    number_section: yes
+  html_document:
+    df_print: paged
+header-includes:
+- \usepackage{booktabs}
+- \usepackage{float}
+- \usepackage{setspace}
+- \doublespacing
+- \usepackage{bm}
+- \usepackage{amsmath}
+- \usepackage{amssymb}
+- \usepackage{amsfonts}
+- \usepackage{amsthm}
+- \usepackage{fancyhdr}
+- \pagestyle{fancy}
+- \fancyhf{}
+- \rhead{William O. Agyapong}
+- \lhead{DS 6336 - Project III Report}
+- \cfoot{\thepage}
+geometry: margin = 0.8in
+fontsize: 11pt
+abstract: |
+  In this project I explored a 12-month sample of bike-share data from the Divvy bike-sharing system in Chicago and incorporated network analysis of the data to identify key stations and community structures. As a result of the large size of data obtained for just one year, a 10% stratified random sample was drawn to ease computational burden without compromising the representativeness of the data population. Bike share users in chicago use bike share for both one-way trips and round trips, but mostly one-way trips, and throughout the weekdays and on weekends, with casual users making more rides on weekends than on weekdays and vice versa for members. The analysis revealed that the Streeter Dr & Grand Avenue bike station is the most central station, while the State St & 95th St station appeared to be the most critical to information flow in the bike-share network. there were many Divvy bike-share stations with low usage of public bikes. The bike-share network can be thought of as involving one big giant component which suggests that similar strategies can be adopted to bring improvement in ridership across all or most of the stations.
+---
+
+
+```{r setup, include=FALSE}
+# Set global options for output rendering
+knitr::opts_chunk$set(echo = F, eval = T, warning = F, message = F, fig.align = "center")
+
+# Load required packages
+library(ggthemes)
+library(RColorBrewer)
+library(ggrepel)
+library(scales)
+library(tidygraph)
+library(ggraph)
+library(tidyverse)
+library(fs)
+# library(magrittr)
+library(igraph)
+library(lubridate)
+library(vroom)
+library(networkD3)
+library(skimr)
+library(janitor)
+library(naniar)
+library(scales)
+library(glue)
+library(patchwork)
+library(knitr)
+library(gghighlight)
+options(kableExtra.auto_format = F) # disable kableExtra automatic global options
+library(kableExtra)
+library(geosphere)
+# library(leaflet)
+
+# Set the current working directory to the file path
+setwd(dirname(rstudioapi::getSourceEditorContext()$path)) 
+
+# Import user-defined helper functions
+source("custom_functions.R")
+```
+
+```{r "Settings"}
+
+# Set default rounding to 4 decimal places
+options(digits = 4)
+
+# Define a default ggplot theme
+theme_set(theme_light())
+
+# Define colors
+primary_col <- "#6FC9E7" # light blue
+primary_col2 <- "#B3DDF2"
+chicago_col <- c(primary_col, "#FF0000") 
+peach <- "#FECCA8"
+light_yelo <- "FEE5B5"
+
+rideable_type_cols <- c(
+      # "classic_bike" = "#4B6337", # dark green
+      "classic_bike" = "#e4d00a",
+      "docked_bike" = "#9B0B16", # dark red
+      "electric_bike" = "#0c457d" # dark blue
+    )
+
+# users_cols <- c("casual" = "#cc181e", "member" = "#559900")
+users_cols <- c("casual" = chicago_col[1], "member" = chicago_col[2])
+```
+
+
+```{r "Importing data", eval=FALSE}
+# bike_trip <- fread("chicago-bikeshare-data.csv")
+
+# Efficiently read all 12 monthly files into one table
+trip_files <- dir_ls("datasets/")
+tripdata <- vroom(trip_files)
+
+# Note: This chunk is disabled from running during report generation.
+```
+
+```{r "Data Munging - part 1", eval=FALSE}
+# Take 10% random stratified samples stratified on rider type and rideable_type
+set.seed(2221) # to aid reproducibility
+tripdata_sample <- tripdata %>% 
+  group_by(member_casual, rideable_type) %>%
+  slice_sample(prop = 0.1) %>%
+  ungroup()
+# Save data for use
+save(tripdata_sample, file = "tripdata_sample.RData")
+
+# Note: This chunk is diabled from running during report geraneration.
+```
+
+```{r "Importing preprocessed data "}
+load("tripdata_sample.RData")
+# dim(tripdata_sample)
+# kable(head(tripdata_sample))
+# kable(tail(tripdata_sample))
+
+```
+
+
+```{r "unique stations", eval=F}
+unique_stations <- data.frame(
+                      attr = c("Unique Station IDs", "Unique Station Names", "Number of Observations"),
+                      full_df = c(
+                                    length(get_unique_stations("id", dat = tripdata)),
+                                    length(get_unique_stations("name", dat = tripdata)),
+                                    nrow(tripdata)
+                                  ),
+                       sample_df = c(
+                                    length(get_unique_stations("id")),
+                                    length(get_unique_stations("name")),
+                                    nrow(tripdata_sample)
+                                  )
+          )
+save(unique_stations, file = "unique_stations.RData")
+```
+
+
+```{r "Data Munging - part 2"}
+# Clean data and create new important variables
+## 1609.344 meters = 1 mile -> 100 m = 100/1609.344 miles
+# mutate(dist_miles = map_dbl(ride_id, calc_trip_dist)) %>%
+tripdata_sample <- tripdata_sample %>%
+  mutate(across(.cols = c("member_casual", "rideable_type"), as.factor)) %>%
+  mutate(
+      duration_sec = interval(started_at, ended_at) %/% seconds(1),
+      duration_details = duration(duration_sec, "seconds"),
+    .after = "ended_at")
+```
+
+
+```{r "Data Munging - part 3"}
+# create new station ids
+stations_id <- get_unique_stations("id")
+new_station_ids <- 1:length(stations_id)
+names(new_station_ids) <- stations_id
+
+tripdata_sample_clean <- tripdata_sample  %>% # reassign station ids
+  mutate(
+    start_station_id = map_int(start_station_id, function(id) {
+      new_station_ids[id]
+  })
+  ) %>% 
+   mutate(
+    end_station_id = map_int(end_station_id, function(id) {
+      new_station_ids[id]
+  })
+  ) %>% 
+  filter(duration_sec >= 60) %>% # Remove trips with less than 60 seconds duration
+  mutate(duration_mins = duration_sec %/% 60) 
+
+# %>%
+#   mutate(
+#     # compute physical distances between trips
+#     geo_distance = map_dbl(ride_id, calc_trip_dist)
+#   )
+
+# summary(tripdata_sample_clean$duration_sec)
+# glimpse(tripdata_sample_clean)
+# head(tripdata_sample_clean)
+```
+
+# Introduction
+
+This project explores the bike-share data from the Divvy bike-share system in Chicago and incorporates network analysis of the data to identify key stations and community structures.
+
+Divvy is a bike-sharing system that now serves the cities of Chicago and Evanston in the Chicago metropolitan area. The Chicago Department of Transportation owns the system, which Lyft has been operating since 2019. Divvy had 5,800 bicycles and 608 stations as of July 2019, covering almost the whole city (except Pullman, Roseland, Beverly, Belmont Cragin, and Edison Park). In the year 2017, National Association of City Transportation Officials (NACTO) named Divvy among the four largest station-based bike share system in the US. According the Wikipedia (2022), the name **Divvy** is a playful reference to sharing ("divvy it up"). The double Vs in the name is a reference to the shared-lane markers painted on bike lanes around the city, and shows the city's commitment to promoting bike safety while also making it easier for novice riders to get around. Divvy’s light-blue color evoke the Chicago flag. 
+
+## Background
+
+Bike sharing systems has become one of the major means of transportation in major cities in the U.S. and around the world. It is great for quick trips around town or leisurely rides through parks. People use it to commute to work or school, run errands and explore cities. According to Alissa Walker, urbanism editor at [Curbed](https://archive.curbed.com/authors/alissa-walker), Bike share has been one of the major success stories in the US transportation system over the last decade. Annual bike-share data from the NACTO indicates that more than 119 U.S. communities now operate bike-share systems, beginning with Tulsa, Oklahoma's program in 2007. Bike share has been proved in studies to increase transit ridership and may even be safer than using personal bikes, since bicycle share schemes raise biker visibility, making riding safer for everyone. 
+
+Regarding how the system operates, users commonly check out a bike with a membership or credit/debit card. They can then ride to their destination and leave the bike at a docking station nearby. Bike-share system bikes are usually comfortable, have integrated locks and cargo baskets and usually includes features that make city biking safe and pleasurable. 
+
+Apart from the safety and environmental friendly mode of transport provided by bike-share systems, they bring huge economic gains by attracting more customers to nearby businesses. For instance, in congested places such as downtown regions, bike share customers spend far less time looking for parking and far more time patronizing neighboring businesses. Additionally, Bike sharing is a great way for individuals to choose active transportation for short trips which has a lot of health benefit since bike riding is a form of good exercise. 
+
+Due to the usefulness and the many benefits provided by bike share systems, many researchers have taken it upon themselves to conduct analyses of bike-share system data to enhance the understanding of the internal mechanisms within bike sharing systems. What is interesting is that in recent years some scholars have placed emphasis on the use of network analysis methodologies. For example, Yao et al. (2019) employed complex network methods to analyze the relationship between stations within the Nanjing bike-sharing system in China.  Rixey (2013) also expanded on prior studies involving the use of station-level ridership data by including the network effects of the size and spatial distribution of the bike sharing station network, resulting in a more robust regression model for predicting station ridership. It is against this background that I sought to embark on this exploratory studies of bike-sharing system networks, and in particular the Chicago Divvy bike-share as a case study.
+
+
+## Objectives
+
+The project aims to provide insight into the Divvy bike-share system data and specifically address the following research questions:
+
+<!-- - How do registered users (members) differ in general and in terms of network structure from that of casual users? -->
+
+- Do different user types (members or casual users) and bike rideable types (classic, docked, and electric bikes) influence ridership in general and in terms of network structure?
+
+- What are the central stations within the bike-share system station network?
+
+- Is there some underlying community structure that can be utilized by the operators of the Chicago public bike-share system to help meet operational needs as well as the needs of bike riders?
+
+Identifying differences in ridership for different users and different rideables, and the underlying network community structure is relevant for the successful operation of bike-share systems such as the Divvy. Also, knowing the central stations  can lead to further studies of those stations to help understand what makes those stations popular for bike ridership and then transfer what is learned, if applicable, to other stations.
+
+## Setting
+
+<!-- Describe the setting, locations, and relevant dates, including periods of recruitment, exposure, follow-up, and data collection -->
+
+Data for this project is a historical trip data maintained by Divvy, the official bike share system in Chicago, and span a 12-month period starting from May 2021 to April 2022. The data is provided according to the Divvy Data License Agreement (2022) and released on a monthly schedule for public use. The trips were made by both members and casual public bike users to and from the over 800 bike-share stations in the Chicago metropolitan area.
+
+## Participants	
+<!-- Describe participants here -->
+The main subjects of the study included the over 800 bike-share stations in the Chicago metropolitan area. Bike trips to and from these stations were made by members of Divvy who are most likely to be local residents, and casual users who are probably visitors to the city.
+
+## Source of data and Variables
+
+All the variables used in this project come from one single source, the Divvy system data. The data were obtained directly from the Divvy company's historical trip records available at https://divvy-tripdata.s3.amazonaws.com/index.html. The data are stored in compressed comma separated formats (csv). The source of the data claims that the data has been processed to remove trips that are taken by staff as they service and inspect the system; and any trips that were below 60 seconds in length (potentially false starts or users trying to re-dock a bike to ensure it was secure). Each trip is anonymized and Table 1 provides information about the trips.
+
+```{r "Variables description", eval=T}
+col_names <- c("Variable Name", "Description", "Data Type")
+
+data.frame(
+  cbind(
+    vars =c("ride_id", "rideable_type", "started_at, ended_at", "start_station_name", "start_station_id",
+    "end_station_name", "end_station_id" , "start_lat, start_lng" , "end_lat, end_lng", "member_casual"
+    ),
+    dsc = c("Unique trip identification number", "Either a classic bike, docked bike, or an electric bike for the trip",
+            "Trip start and end day and time", "Trip start station name", "Trip start station ID",
+            "Trip end station name", "Trip end station ID", "Pick-up station location latitude and longitude",
+            "Bike return station location latitude and longitude",
+            "Whether the trip involved a subscribed member or a casual rider"
+            ),
+    type = c("Alphanumeric character", "Character/categorical", "Date/Time", "Character/categorical", "Alphanumeric character/categorical", "Character/Categorical", "Alphanumeric character/categorical", "Numeric", "Numeric", "Character/Categorical")
+  )
+) %>%
+  kable(format = "latex", linesep="", booktab=T,
+    col.names = col_names,
+    caption = "Available variables and their definitions"
+    )  %>%
+  column_spec(1, width = "10em") %>%
+  column_spec(2, width = "20em") %>%
+  column_spec(3, width = "15em") %>%
+       kable_styling(font_size = 10,  latex_options = c("HOLD_position"))
+```
+
+Except for the ride id and the geographic location variables (longitudes and latitudes), the project utilized all the variables listed in Table 1.
+
+## Bias
+
+It is worthy of mention that the study results or findings may be biased for several reasons. One such source of bias could arise from the sampling procedure. To address sampling bias, a probability sampling scheme called stratified sampling as described in Section 2. The sampling frame used also helped to address any potential class imbalance from the  different user types and rideable types. Additionally, Weather conditions are an important influencing factors for the use of bike-share systems but such information were not available from the data repository.
+ 
+ 
+## Study size
+
+The 12 months data were individually imported into the R statistical software and merged together with the help of the `vroom` R package. This resulted in a dataset with **5,757,551** observations measuring the total number of trips recorded over the one year period under review. Due to the huge number of observations, I took a 10% stratified random sample across the user type and rideable type variables. The stratification was done to ensure balanced representative sample. A final study size of **455275** after removing missing data was used. Table 2 presents details of the one year imported data set and the stratified sample. 
+
+<!-- Explain how the study size was arrived at -->
+```{r "original vs sampled", eval=T}
+load("unique_stations.RData")
+kable(unique_stations,  
+      col.names = c("Attribute", "Full 12 Months Data", "10% Stratified Sample"), 
+      caption = "Original Data Versus Sampled Data")
+```
+
+From Table 2, we have **854/862** unique stations in the sampled data compared to the **857/866** unique stations. in the full 12 months worth of data. This means our stratified sampled data is representative of the full data set. One would expect the number of distinct station ids to be equal to the distinct number of station names. However, this is not the case for the trip data under consideration for whatever reason, so I resorted to using the station names as those hold more meaningful information. 
+
+
+
+
+ 
+All statistical analyses and visualizations were conducted in the R statistical software. Codes for the analysis and report creation is available upon request. The rest of the report is organized as follows. Section 2 presents methods covering graph theory concepts and analysis and the sampling techniques used. Results from various exploratory and network analyses are presented in section 3. I conclude the report with a brief discussion of the results including key findings, interpretation and generalisability of findings in section 4.
+
+
+# Methodology
+
+## Stratified Random Sampling
+
+It is often not realistic to work with data from an entire population, so a subset of data is selected through a number of ways. This project utilized the stratified random sampling method. Stratified random sampling is a probability sampling scheme where the target population is divided into distinct classes called strata. Subjects within each strata are similar in terms of some characteristics from the population. It allows researchers to obtain samples that best represents the overall population being studied. Here in this project, the large data set obtained were grouped by the user type and rideable type variables. After that 10% random samples from each resulting group were taken to obtain a balanced reasonable sample size.
+
+## Graph Theory Concepts 
+
+Networks were utilized in largely in this project to answer meet the study objectives. In graph theory, a network is defined, in its simplest form, as a collection of points joined together in pairs by lines, where a point is referred to as a node or vertex and a line is referred to as an edge. In the mathematical literature, a network is also called a graph. Nodes are often chosen to represent research objects, while edges connecting any two nodes denote a relationship of some kind. A network could either be directed or undirected, weighted or unweighted. In a directed network each edge has a direction, pointing from one node to another. Edges that connect nodes to themselves are called *self-edges* or *self-loops*. A network that has neither self-edges nor multiedges is called a *simple network*.
+
+To construct the networks for the project, I treated bike-share stations as the nodes and edges as directed links pointing from from station A to station B if there was a trip between the two stations. Each edge is weighted by the number of trip records from one station to the other. The final networks were constructed from edge list data frame that I created consisting the starting station name and the ending station name with weigths, user types and rideable types attributes.
+ 
+
+### Centrality Measures
+
+Centrality measures quantify how important or central nodes are in a network, where the definition of importance often relies on the particular context from which the network was derived. This report considers the four popular centrality measures which are described in the below.
+
+**Degree**
+
+Degree is the simplest centrality measure for a node in a network which measures the number of connections (edges) the node has. In directed networks, nodes have both an *in-degree* and an *out-degree*, and both may be useful as measures of centrality in the appropriate circumstances. The out-degree of a node is the number of other nodes to which a vertex has an outgoing edge directed to. The in-degree is the number of edges received from other vertices. A node with the highest degree has the most connections to other nodes in the network. This means degree centrality can help us find very connected individuals, popular individuals, individuals who are likely to hold most information or individuals who can quickly connect with the wider network.
+
+ **Betweenness**
+
+The amount of times a node is on the shortest path between other nodes is measured by betweenness centrality. A path is a series of adjacent nodes ( A series of edges that take us from one node to another node). The shortest path between any two nodes is the least amount of total steps (or edges). If a node C is on a shortest path between A and B, then it means C is important to the efficient flow between A and B. Flows would have to take a longer route from A to B without C. As a result, betweenness measures how many shortest pathways each node has. Nodes with high betweenness are key bridges between different parts of a network. The higher a node’s betweenness, the more important they are for the efficient flow in a network. Betweenness centrality can be very large, so it is often helpful to normalize it by dividing by the maximum and multiplying by some scalar when plotting.
+
+**Closeness**
+
+The closeness centrality also makes use of the shortest paths between nodes. The length of the shortest path between two nodes is used to calculate the distance between them. The average distance between a node and all other nodes is called farness. Closeness is then the reciprocal of farness (1/farness).
+
+**Eigenvector Centrality**
+
+Degree centrality only takes into account the number of edges for each node, but it leaves out information about the relative importance of the neighboring nodes. In many circumstances a node’s importance in a network is increased by having connections to other nodes that are themselves important. For instance, If A and B have the same degree centrality, but A has ties with all high degree individuals and B is related to all low degree individuals, the we would want to see A with a higher score than B. This is where the eigenvector centrality comes in as an extension of the degree centrality by also taking into account how well connected a node is, and how many edges their connections have, and so on through the network. In other words, the eigenvector centrality awards each node points proportional to the centrality scores of their neighbors.
+
+### Measuring Network Structure
+
+**Density** of a network is the proportion of edges that actually exist out of the total possible edges that can be formed. This also indicates how interconnected a network is. Another measure of how interconnected a network is **average path length**. This is computed by determining the mean of the lengths of the shortest paths between all pairs of vertices in the network. The longest path length between any pair of vertices is called the **diameter** of the network graph. 
+
+A related concept is **community detection**. Community detection is very useful in understanding and examining the structure of large networks such as the ones considered in this project. A measure known as modularity is used to assess the quality of community division. I used the Louvain and walktrap community detection algorithms because they are often used in practice and have proved to work well with large networks. The task of community detection can be seen as an optimization problem. Louvain is an agglomerative modulatiry optimization algorithm for finding community structure in a network. It is well-known for its speed. At the beginning, each node is assigned to a community on its own. In subsequent steps each node is combined with the community that increases modularity the most. Several rounds are repeated until a configuration where nothing changes or where the modularity cannot be improved any further. The final configuration is then taken asthe community division of the network. The **walktrap** algorithm is also agglomerative but it uses random walks instead of modularity whereby "distance" between nodes are measured through random walks in the network. The basic idea of the algorithm is that random walks on a graph or network tend to get trapped into densely connected parts corresponding to communities. The quality of the divisions can be assessed using either modularity or any other measure.
+
+<!-- -->
+
+
+# Analysis and Results
+
+## Exploratory Data Analysis
+
+### Data anomalies and missing data
+
+```{r "trip duration anomalies"}
+# Get trip duration anomalies
+tripdata_sample %>%
+  mutate(duration_group = as.factor(ifelse(duration_sec < 0, "Negative", 
+                                 ifelse(duration_sec == 0, "Zero time",
+                                        ifelse(duration_sec >=60,"60 seconds or more", "More than 0 but below 60 seconds"))))) %>%
+  group_by(duration_group) %>%
+    summarise(freq=n()) %>%
+  ggplot(aes(reorder(duration_group, -freq), freq, fill = duration_group)) +
+   geom_bar(stat='identity',alpha=0.7) + 
+  scale_fill_manual(values = c(chicago_col[1], peach, "black", "pink")) +
+  labs(x="", y="Trip Duration in Seconds", title = "Figure 1: Trip Duration Anomalies") +
+  theme(legend.position = "none", plot.title = element_text(size=12, hjust = 0.5),
+        axis.text.x=element_text(angle=45,vjust=0.5)) +
+  scale_y_continuous(label=comma_format()) +
+  geom_text_repel(aes(label=freq)) 
+  # geom_text(aes(label= freq, size=0.4), hjust= 0.5, vjust=-0.3)
+
+# ggplot(tripdata_sample_clean, aes(duration_mins)) +
+#   geom_boxplot() +
+#   geom_vline(xintercept = 1, color = "red", linetype = "dashed") +
+#   geom_vline(xintercept = 6, color = "red", linetype = "dashed") +
+#   geom_vline(xintercept = 11, color = "red", linetype = "dashed")
+# tripdata_sample_clean %>%
+#  pull(duration_sec) %>% 
+#   log() %>% 
+#   boxplot(main = "Log of Trips duration",
+#           xlab = "log",medlty = 2,
+#           medlwd = 2,
+#           medpch = 22,
+#           medcex = 2,
+#           medcol = 2,
+#           medbg = 1,
+#           border = "darkred",
+#           horizontal = TRUE,
+#           frame = FALSE)
+```
+According to the data description from the data source (https://ride.divvybikes.com/system-data), the trip data were preprocessed to remove trips that lasted below 60 seconds, meanwhile this initial exploration of the data has revealed a good number of trips having trip duration below 60 seconds and even negative time duration. Therefore, without any further information to point out what could be responsible for the obvious anomalies, I decided to discard trips whose time length were below 60 seconds and such trips amounted to **9,285** as can be seen in the above graph.  Next is a table of missing data present after removing the observations with unreasonable trip time length.
+
+```{r "missing data"}
+library(UpSetR)
+
+miss_var_summary(tripdata_sample_clean) %>%
+  filter(n_miss > 0) %>%
+  mutate(pct_miss = str_c(round(pct_miss, 2),"%")) %>%
+  kable(booktabs = T, caption = "Missing values in the 10% stratified sample data") %>%
+      kable_styling(font_size = 10)
+
+# skim(tripdata_sample_clean) %>% 
+#   select(skim_variable, complete_rate) %>% 
+#   mutate(perct_missing = str_c(round(abs(complete_rate - 1),4),"%")) %>% 
+#   filter(perct_missing != "0%") %>% 
+#   kable(caption = "Missing Data", col.names = c("Variable Name", "Complete Rate", "Percent Missing"))
+
+# missing data interactions
+# missing_data_uoset_tbl <- tripdata_sample_clean %>% 
+#   select( start_station_id,
+#          end_station_id)
+
+# gg_miss_upset(
+#   missing_data_uoset_tbl,
+#   main.bar.color = "#4c8c08",
+#   show.numbers = "yes",
+#   sets.bar.color = "#4c8c08",
+#   matrix.color = "#a00000",
+#   shade.color = "#4c8c08",
+#   order.by = "freq",
+#   point.size = 3,
+#   line.size = 0.75,
+#   shade.alpha = 0.2,
+#   text.scale = c(1.6, 1.3, 1, 1, 1.3, 1.3)
+# )
+
+## remove missing values
+# dim(tripdata_sample_clean) # 566468
+```
+
+
+```{r "missing data deletion"}
+tripdata_sample_clean <- tripdata_sample_clean %>% na.omit()
+# dim(tripdata_sample_clean) # 566468 455275
+```
+
+Table 3 reveals what I observed from the data set where some of the trips had station name or id and location. Given the limited amount of information about these missingness and the fact that we already have more than large enough sample, I removed the rows of the data with any missing record from the data set resulting in a final sample size of **455,275** for the study.
+
+
+### Types of users and rideable types and the rides per day of week
+
+The figures 2 and 3 below show the distribution of rides in thousands (K) for the two types of users, members and casual users as well as the distribution of rideables, respectively. We can see that there are more members (subscribers) than casual bike riders, with a difference of about $12\%$. Clearly, members and casual users show different usage patterns throughout the week. Casual users tend to use bikes more during weekends (from about Friday midnight to Sunday midnight) than during the weekdays.
+
+According to figure 3, **Classic bikes are the most patronized bikes with a 69% share of the total ridership**. Looks like Docked bikes are likely to phase out over time. A yearly analysis can be very useful in discovering how the usage patterns has been evolving over time.
+
+```{r}
+member_casual_col <- tripdata_sample_clean %>%
+  select(member_casual, started_at) %>%
+  drop_na(started_at, member_casual) %>%
+  mutate(weekday = wday(started_at)) %>%
+  group_by(weekday, member_casual) %>%
+  summarise(counts = n(),
+            .groups = "drop") %>%
+  ungroup() %>%
+  arrange(desc(counts)) %>%
+  ggplot() +
+  geom_line(aes(weekday, counts, color = member_casual),
+            size = 1.5) +
+  scale_x_continuous(breaks = c(1,2,3,4,5,6,7),
+    labels = c("Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat")) +
+  scale_y_continuous(labels = label_number(suffix = "K", scale = 1e-3)) +
+  scale_color_manual(
+    name = NULL,
+    values = users_cols,
+    labels = c("Casual", "Member")
+  ) +
+  theme(legend.position = "bottom") +
+  labs(title = "Figure 2: Distributions of Rides by day of week and type of bike users",
+       x = NULL,
+       y = NULL)
+
+member_casual_pie <- tripdata_sample_clean %>%
+  count(member_casual, name = "counts", sort = T) %>%
+  mutate(prop = (counts / sum(counts)) * 100) %>%
+  arrange(desc(prop)) %>%
+  ggplot(aes("", counts)) +
+  geom_col(
+    aes(fill = factor(member_casual)),
+    show.legend = FALSE,
+    position = "fill",
+    color = "white",
+    size = 1.5
+  ) +
+  geom_text(
+    aes(
+      label = str_c(round(prop), "%"),
+      group = factor(member_casual)
+    ),
+    position = position_fill(vjust = 0.5),
+    color = "white",
+    size = 4,
+    show.legend = FALSE,
+    fontface = "bold"
+  ) +
+  coord_polar(theta = "y") +
+  theme_void() +
+  scale_fill_manual(values = users_cols) +
+  theme_void() +
+  labs(caption = "",
+       fill = "")
+
+(member_casual_col + member_casual_pie)
+```
+
+```{r}
+rideable_type_col <- tripdata_sample_clean %>%
+  select(rideable_type, started_at) %>%
+  drop_na(started_at, rideable_type) %>%
+  mutate(weekday = wday(started_at)) %>%
+  group_by(weekday, rideable_type) %>%
+  summarise(counts = n(),
+            .groups = "drop") %>%
+  ungroup() %>%
+  arrange(desc(counts)) %>%
+  ggplot() +
+  geom_line(aes(weekday, counts, color = rideable_type),
+            size = 1.5) +
+  scale_x_continuous(breaks = c(1,2,3,4,5,6,7),
+    labels = c("Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat")) +
+  scale_y_continuous(labels = unit_format(unit = "K", scale = 1e-3)) +
+  scale_color_manual(
+    name = NULL,
+    values = rideable_type_cols,
+    labels = c("Classic bike", "Docked bike", "Electric bike")
+  ) +
+  theme(legend.position = "bottom") +
+  labs(title = "Figure 3: Distributions of Rides by day of week and rideable types",
+       x = NULL,
+       y = NULL)
+
+rideable_type_pie <- tripdata_sample_clean %>%
+  count(rideable_type, name = "counts", sort = T) %>%
+  mutate(prop = (counts / sum(counts)) * 100) %>%
+  arrange(desc(prop)) %>%
+  ggplot(aes("", counts)) +
+  geom_col(
+    aes(fill = factor(rideable_type)),
+    position = "fill",
+    color = "white",
+    size = 1 ,
+    show.legend = FALSE
+  ) +
+  geom_text(
+    aes(
+      label = str_c(round(prop), "%"),
+      group = factor(rideable_type)
+    ),
+    position = position_fill(vjust = 0.3),
+    color = "white",
+    size = 3.5,
+    show.legend = FALSE,
+    fontface = "bold"
+  ) +
+  coord_polar(theta = "y") +
+  theme_void() +
+  scale_fill_manual(
+    name = NULL,
+    values = rideable_type_cols,
+    labels = c("Classic bike", "Docked bike", "Electric bike")
+  ) +
+  theme_void() +
+  labs(title = NULL,
+       caption = "",
+       fill = "")
+
+# display plots
+(rideable_type_col + rideable_type_pie)
+```
+
+
+<!-- ### Weekday versus weekend rides by types of customers -->
+
+```{r eval=FALSE}
+weekday_weekend_member <- tripdata_sample_clean %>%
+  filter(member_casual == "member") %>%
+  select(member_casual, started_at) %>%
+  drop_na(started_at, member_casual) %>%
+  mutate(
+    weekday = wday(started_at, label = TRUE),
+    weekday_weekend = if_else(weekday %in% c("Sat", "Sun"), "Weekend", "Weekday")
+  ) %>%
+  group_by(weekday_weekend) %>%
+  summarise(counts = n()) %>%
+  mutate(prop = (counts / sum(counts)) * 100) %>%
+  arrange(desc(prop)) %>%
+  ggplot(aes("", counts)) +
+  geom_col(
+    aes(fill = weekday_weekend),
+    show.legend = FALSE,
+    position = "fill",
+    color = "white",
+    size = 2,
+    width = 1,
+    alpha = 0.7
+  ) +
+  geom_text(
+    aes(
+      label = str_c(round(prop), "%", "\n", weekday_weekend),
+      group = weekday_weekend
+    ),
+    position = position_fill(vjust = 0.5),
+    color = "white",
+    size = 4.5,
+    show.legend = FALSE,
+    fontface = "bold"
+  ) +
+  scale_fill_manual(values = c("Weekday" = "#bf161c", "Weekend" = "#800e13")) +
+  # c("Weekday" = "#4C8C08", "Weekend" = "#1e4d04")
+  coord_polar(theta = "y") +
+  theme_void() +
+  theme(plot.title = element_text(
+    hjust = 0.5,
+    # colour = "#559900",
+    # color = users_cols[2],
+    size = 15
+  )) +
+  labs(title = "Figure 4: Member Rides",
+       fill = "")
+
+weekday_weekend_casual <- tripdata_sample_clean %>%
+  filter(member_casual == "casual") %>%
+  select(member_casual, started_at) %>%
+  drop_na(started_at, member_casual) %>%
+  mutate(
+    weekday = wday(started_at, label = TRUE),
+    weekday_weekend = if_else(weekday %in% c("Sat", "Sun"), "Weekend", "Weekday")
+  ) %>%
+  group_by(weekday_weekend) %>%
+  summarise(counts = n()) %>%
+  mutate(prop = (counts / sum(counts)) * 100) %>%
+  arrange(desc(prop)) %>%
+  ggplot(aes("", counts)) +
+  geom_col(
+    aes(fill = weekday_weekend),
+    show.legend = FALSE,
+    position = "fill",
+    color = "white",
+    size = 2,
+    width = 1,
+    alpha = 0.7
+  ) +
+  geom_text(
+    aes(
+      label = str_c(round(prop), "%", "\n", weekday_weekend),
+      group = weekday_weekend
+    ),
+    position = position_fill(vjust = 0.5),
+    color = "white",
+    size = 4.5,
+    show.legend = FALSE,
+    fontface = "bold"
+  ) +
+  scale_fill_manual(values = c("Weekday" = primary_col2, "Weekend" = primary_col)) +
+  # c("Weekday" = "#bf161c", "Weekend" = "#800e13")
+  coord_polar(theta = "y") +
+  theme_void() +
+  theme(plot.title = element_text(
+    hjust = 0.5,
+    # colour = "#cc181e",
+    # color = primary_col,
+    size = 15
+  )) +
+  labs(title = "Figure 5: Casual Rides",
+       caption = "",
+       fill = "")
+
+weekday_weekend_member + weekday_weekend_casual
+```
+
+<!-- The information presented by Figures 4 and 5 confirms our earlier observation that causual customers rent bikes more during the weekends that do member users. -->
+
+
+### Weekday vs weekend trips and daily trips
+```{r "weekday vs weekend trips"}
+plt1 <- tripdata_sample_clean %>%
+  select(member_casual, started_at) %>%
+  drop_na(started_at, member_casual) %>%
+  mutate(
+    weekday = wday(started_at, label = TRUE),
+    weekday_weekend = if_else(weekday %in% c("Sat", "Sun"), "Weekend", "Weekday"),
+    started_at_hour = hour(started_at)
+  )  %>%
+  count(started_at_hour, member_casual, weekday_weekend, name = "counts") %>%
+  ggplot(aes(started_at_hour, y = counts, color = member_casual)) +
+  geom_line(size = 1.3) +
+  facet_wrap(vars(weekday_weekend), ncol = 1) +
+  scale_color_manual(values = users_cols,
+                                labels = c("Casual", "Member")) +
+  scale_y_continuous(labels = unit_format(unit = "K", scale = 1e-3)) +
+  theme(axis.text.x = element_text(angle = 90)) +
+  theme(strip.background = element_rect(fill = rideable_type_cols[3])) +
+  theme(strip.text = element_text(
+    colour = 'white',
+    size = 11,
+    face = "bold"
+  )) +
+  labs(
+    title = "Figure 4: Weekday VS Weekend\n Trips By Time Of Day",
+    caption = "",
+    x = "Time",
+    y = "Number of Trips",
+    color = NULL
+  )
+```
+
+```{r}
+day_year <- tripdata_sample_clean %>%
+  select(started_at) %>%
+  mutate(day_m_y = date(started_at)) %>%
+  group_by(day_m_y) %>%
+  summarise(counts = n(), .groups = "drop") %>%
+  mutate(sun_sat = wday(day_m_y, label = TRUE),
+         avg = mean(counts)) %>%
+  ungroup() %>%
+  arrange(desc(counts))
+  
+
+sun_sat_df <- day_year %>% 
+  filter(sun_sat %in% c("Sun", "Sat"))
+
+
+plt2 <- ggplot(day_year) +
+  geom_line(aes(day_m_y, counts), color = "gray80") +
+  geom_hline(
+    aes(yintercept = avg),
+    color = primary_col,
+    size = 1.5,
+    linetype = "dashed"
+  ) +
+  geom_point(data = sun_sat_df,
+             aes(day_m_y, counts, color = sun_sat),
+             size = 2) +
+  scale_color_manual(values = c("Sat" = "orange",
+                                "Sun" = "#030056")) +
+  theme_classic() +
+  theme(legend.position = "top") +
+  labs(
+    title = "Figure 5: Daily rides\n (number of trips)",
+    x = "Days in the year",
+    y = "Counts",
+    caption = "",
+    color = NULL
+  )
+
+plt1
+
+plt2
+
+```
+
+
+**Bike usage fluctuates throughout the day, and the majority of trips occurred between 6 am and 8 pm.** On weekdays, members and casual users show different travel patterns. Members show commute activity (spikes in usage from 7:00 – 9:00 and 17:00 – 19:00), and constant usage throughout the day. Casual usage increased throughout the day with a constant peak from noon-7pm. On the weekends, members and casual users exhibit similar behavior with the daytime peak occurring between 2-4pm. - Casual users made a higher proportion of mid-day trips.
+
+The trend line spikes in Figure 5 represent the high usage of bikes, usually on Saturday and Sunday, and on some weekends the bike usage dropped; The drop is likely to have occurred during the Holidays or the winter period. The usage in summer time is above the average (the green dashed line).
+
+
+## Network Analysis
+
+Now that we have gleaned much information from the Divvy May 2021 - April 2022 bike-share trip data set, it is time to look at the networks constructed from the same data set. In this section I present results obtained from performing various network analysis in an attempt to help answer the research questions motivating the study.
+
+### Network construction and characteristics
+
+To create networks, the trips data were grouped by the start and end station names (so as to make them the vertices in the network) and summarized to get all the trips that occurred between any given pair of stations and edge weights.  After obtaining an edge list data frame from the previous operation, a giant network having 843 veritices (bike stations) and 160,754 edges was constructed. This network I called full network. A second network data was created by taking another 2% stratified random sample from which sub graphs for the user types and rideable types were constructed for the purpose of network visualization.  The same subset of edge list data was used to construct the network for the community structure detection analysis.  I left out a plot of this large network since it did not make for a good viewing. However, I computed the centrality measures from this main graph to help identify the key stations in the Divvy bike share system. Numerical characteristics of the resulting networks are presented in Table 4. 
+
+
+```{r, "main graph", eval=T}
+# network dat for main graph
+trip_graph <- tripdata_sample_clean %>%
+  group_by(start_station_name, end_station_name) %>%  # , member_casual, rideable_type
+  summarize(
+    # Set weights as proportion of total trips
+    weights = n()
+  ) %>%
+  graph_from_data_frame()
+
+# network data based on a drawn sample
+set.seed(010)
+trip_net_df <- tripdata_sample_clean %>%
+  group_by(member_casual, rideable_type) %>%
+  slice_sample(prop = 0.02)
+    # dplyr::slice(1:200) 
+
+member_graph <- trip_net_df %>%
+  filter(member_casual == "member") %>%
+  group_by(start_station_name, end_station_name) %>% 
+  summarize(
+    # Set weights as proportion of total trips
+    weights = n()
+  ) %>% ungroup() %>% graph_from_data_frame()
+
+casual_graph <- trip_net_df %>%
+  filter(member_casual == "casual") %>%
+  group_by(start_station_name, end_station_name) %>% 
+  summarize(
+    weights = n()
+  ) %>% ungroup()%>% graph_from_data_frame()
+
+classic_graph <- trip_net_df %>%
+  filter(rideable_type == "classic_bike") %>%
+  group_by(start_station_name, end_station_name) %>% 
+  summarize(
+    weights = n()
+  ) %>% ungroup()%>% graph_from_data_frame()
+
+docked_graph <- trip_net_df %>%
+  filter(rideable_type == "docked_bike") %>%
+  group_by(start_station_name, end_station_name) %>% 
+  summarize(
+    weights = n()
+  ) %>% ungroup()%>% graph_from_data_frame()
+
+electric_graph <- trip_net_df %>%
+  filter(rideable_type == "electric_bike") %>%
+  group_by(start_station_name, end_station_name) %>% 
+  summarize(
+    weights = n()
+  ) %>% ungroup()%>% graph_from_data_frame()
+
+
+# trip_graph2 <- graph_from_data_frame(trip_net_df2)
+
+measures <- c("Number of Vertices", "Number of Edges", "Density (edges)", "Average path length", "Diameter")
+main_trip_measures <- c(vcount(trip_graph), gsize(trip_graph), edge_density(trip_graph), mean_distance(trip_graph, directed = F), diameter(trip_graph, directed = F))
+
+member_measures <- c(vcount(member_graph), gsize(member_graph), edge_density(member_graph), mean_distance(member_graph, directed = F), diameter(member_graph, directed = F))
+
+casual_measures <- c(vcount(casual_graph), gsize(casual_graph), edge_density(casual_graph), mean_distance(casual_graph, directed = F), diameter(casual_graph, directed = F))
+
+classic_measures <- c(vcount(classic_graph), gsize(classic_graph), edge_density(classic_graph), mean_distance(classic_graph, directed = F), diameter(classic_graph, directed = F))
+
+docked_measures <- c(vcount(docked_graph), gsize(docked_graph), edge_density(docked_graph), mean_distance(docked_graph, directed = F), diameter(docked_graph, directed = F))
+
+electric_measures <- c(vcount(electric_graph), gsize(electric_graph), edge_density(electric_graph), mean_distance(electric_graph, directed = F), diameter(electric_graph, directed = F))
+
+# display results
+data.frame(measures, main_trip_measures, member_measures, casual_measures, classic_measures,
+           docked_measures,electric_measures ) %>%
+ kable(booktabs = T, linesep = "", col.names = c("Characteristic", "Full Graph",
+                                                 "Member Graph", "Casual Graph",
+                                                 "Classic Graph", "Docked Graph",
+                                                 "Electric Graph"), align = "lcc",
+        caption = "Characteristics of constructed networks") %>%
+    kable_paper() %>%
+    kable_styling(latex_options = c("HOLD_position"))
+```
+
+### Ranking stations by Centrality Measures computed from the full graph
+
+```{r}
+# gsize(trip_graph)
+# gorder(trip_graph)
+
+centralities <- data.frame(
+    degree = degree(trip_graph, mode = "all"),
+    indeg  = degree(trip_graph, mode = "in"),
+    outdeg = degree(trip_graph, mode = "out"),
+    ec = eigen_centrality(trip_graph)$vector,
+    closeness = closeness(trip_graph),
+    between = betweenness(trip_graph)
+)
+
+# make row names a variable
+centralities <- tibble::rownames_to_column(centralities, "station")
+```
+
+Interestingly, apart from the betweenness centrality the *Streeter Dr. & Grand Avenue* station appears to be the most popular station in the sampled data followed by *Wells St & Concord Ln* and *Michigan Ave & Oak St* in either second or third positions for the most part. In terms of betweeness centrality the *State St & 95th St* station is the most central. Though, closeness centrality ranked the *Streeter Dr. & Grand Avenue* in first place, the differences between the rankings is not that significant as depicted by the roughly equal sizes of the bars.
+
+
+**Figure 6: Top 10 Stations According to Centrality Measures**
+```{r}
+## By degree
+top_10_stations_by_deg <- centralities %>%
+  arrange(desc(degree)) %>%
+  slice(1:10) %>%
+  select(station, degree) %>%
+  mutate(station = fct_reorder(station, degree))
+
+# plot
+  top_10_stations_by_deg_plt <- ggplot(top_10_stations_by_deg) +
+  geom_col(aes(station, degree, fill = station),
+           width = 0.8,
+           show.legend = FALSE) +
+  coord_flip() +
+  scale_fill_viridis_d(option = "C", direction = -1) +
+  labs(title = "Ranked By Degree Centrality",
+       x = NULL,
+       y = NULL)
+
+## By in-degree
+top_10_stations_by_indeg <- centralities %>%
+  arrange(desc(indeg)) %>%
+  slice(1:10) %>%
+  select(station, indeg) %>%
+  mutate(station = fct_reorder(station, indeg))
+
+# plot
+  top_10_stations_by_indeg_plt <- ggplot(top_10_stations_by_indeg) +
+  geom_col(aes(station, indeg, fill = station),
+           width = 0.8,
+           show.legend = FALSE) +
+  coord_flip() +
+  scale_fill_viridis_d(option = "C", direction = -1) +
+  labs(title = "Ranked By In-degree Centrality",
+       x = NULL,
+       y = NULL)
+  
+## By out-degree
+top_10_stations_by_outdeg <- centralities %>%
+  arrange(desc(outdeg)) %>%
+  slice(1:10) %>%
+  select(station, outdeg) %>%
+  mutate(station = fct_reorder(station, outdeg))
+
+# plot
+  top_10_stations_by_outdeg_plt <- ggplot(top_10_stations_by_outdeg) +
+  geom_col(aes(station, outdeg, fill = station),
+           width = 0.8,
+           show.legend = FALSE) +
+  coord_flip() +
+  scale_fill_viridis_d(option = "C", direction = -1) +
+  labs(title = "Ranked By OUt-degree Centrality",
+       x = NULL,
+       y = NULL)
+  
+## By eigenvector
+top_10_stations_by_eigen <- centralities %>%
+  arrange(desc(ec)) %>%
+  slice(1:10) %>%
+  select(station, ec) %>%
+  mutate(station = fct_reorder(station, ec))
+
+# plot
+  top_10_stations_by_eigen_plt <- ggplot(top_10_stations_by_eigen) +
+  geom_col(aes(station, ec, fill = station),
+           width = 0.8,
+           show.legend = FALSE) +
+  coord_flip() +
+  scale_fill_viridis_d(option = "C", direction = -1) +
+  labs(title = "Ranked By Eigenvector Centrality",
+       x = NULL,
+       y = NULL)
+  
+## By betweenness
+top_10_stations_by_between <- centralities %>%
+  arrange(desc(between)) %>%
+  slice(1:10) %>%
+  select(station, between) %>%
+  mutate(station = fct_reorder(station, between))
+
+# plot
+  top_10_stations_by_between_plt <- ggplot(top_10_stations_by_between) +
+  geom_col(aes(station, between, fill = station),
+           width = 0.8,
+           show.legend = FALSE) +
+  coord_flip() +
+  scale_fill_viridis_d(option = "C", direction = -1) +
+  labs(title = "Ranked By Betweenness Centrality",
+       x = NULL,
+       y = NULL)
+
+## By closeness
+top_10_stations_by_close <- centralities %>%
+  arrange(desc(closeness)) %>%
+  slice(1:10) %>%
+  select(station, closeness) %>%
+  mutate(station = fct_reorder(station, closeness))
+
+# plot
+  top_10_stations_by_close_plt <- ggplot(top_10_stations_by_close) +
+  geom_col(aes(station, closeness, fill = station),
+           width = 0.8,
+           show.legend = FALSE) +
+  coord_flip() +
+  scale_fill_viridis_d(option = "C", direction = -1) +
+  labs(title = "Ranked By Closeness Centrality",
+       x = NULL,
+       y = NULL)
+
+  
+
+(top_10_stations_by_deg_plt / top_10_stations_by_eigen_plt) 
+  
+(top_10_stations_by_indeg_plt / top_10_stations_by_outdeg_plt)
+  
+(top_10_stations_by_between_plt / top_10_stations_by_close_plt)
+  
+```
+
+
+Network graphs for the sub groups defined by user type and rideable type are presented in Figure 7 and Figure 8. Since the four centrality measures produced fairly similar rankings in terms of which station appeared in the top 10, for the subgraphs I only presented network plots where the size of vertices are normalized by the degree centrality. Generally it can be seen that the vertices are not well separated into the various groups created by the user type and rideable type, depicting a similar underlying network structure. 
+
+**Figure 7: Sub network by user types** 
+```{r "full networks", eval=T}
+# Prepare network data
+# trip_net_df <- tripdata_sample_clean %>% 
+#   group_by(member_casual, rideable_type) %>%
+#     slice_sample(prop = 0.05) 
+
+
+# Create full graph data
+# trip_net_df_ <- trip_net_df %>%
+#   group_by(start_station_name, end_station_name) %>% 
+#   summarize(
+#     # Set weights as proportion of total trips
+#     weights = n()
+#   ) %>%
+#   filter(weights >=2)
+
+# trip_net_df2 <- trip_net_df %>%
+#   group_by(start_station_name, end_station_name, member_casual, rideable_type) %>% 
+#   summarize(
+#     # Set weights as proportion of total trips
+#     weights = n()
+#   ) %>%
+#   mutate(
+#     member_casual_coded = ifelse(member_casual == "casual", 1, 2),
+#     rideable_type_coded = ifelse(rideable_type == "classic_bike", 1, 
+#                                  ifelse(rideable_type == "docked_bike", 2, 3))
+#     ) %>%
+#   ungroup()
+# 
+# 
+# # Create graph
+#  full_trip_graph <- graph_from_data_frame(trip_net_df2[,1:2], directed = T)
+#  # full_trip_graph <- simplify(full_trip_graph)
+#  
+# # Add vertex attributes
+# V(full_trip_graph)$member_casual <- trip_net_df2$member_casual
+# V(full_trip_graph)$rideable_type <- trip_net_df2$rideable_type
+# V(full_trip_graph)$member_casual_coded <- trip_net_df2$member_casual_coded
+# V(full_trip_graph)$rideable_type_coded <- trip_net_df2$rideable_type_coded
+
+# create vertex colors
+# users_net_col <- 
+
+# create vertex label
+# deg_vec <- degree(trip_graph2, mode = "all", loops = TRUE)
+# station_names <- V(trip_graph2)$name
+# subnames <- station_names[deg_vec > quantile(deg_vec, .9)] # above 75th quantile
+# vcol <- node_attr(full_trip_graph, subnames, color = T)
+
+par(mfrow = c(1,2))
+set.seed(222)
+plot(
+  member_graph, 
+  vertex.label = NA, 
+  vertex.color = users_cols[2],
+  edge.arrow.width = 0.8,
+  edge.arrow.size = 0.2,
+  vertex.size = degree(member_graph, mode = "all", loops = TRUE)/10 + 3,
+   # vertex.size = sqrt(deg_vec)/3,
+  main = "Member Users Network",
+  layout = layout.fruchterman.reingold
+)
+# legend("bottom", legend = c("Casual users", "Members"),
+#            pt.cex=1.5, pt.bg = users_cols, pch = 21, cex = 0.7, 
+#            bty = "n", ncol = 1)
+
+
+set.seed(222)
+plot(
+  casual_graph, 
+  vertex.label = NA, 
+  vertex.color = users_cols[1],
+  edge.arrow.width = 0.8,
+  edge.arrow.size = 0.2,
+  vertex.size = degree(casual_graph, mode = "all", loops = TRUE)/10 + 3,
+  # vertex.size = deg_vec/10 +1,
+  # vertex.size = sqrt(deg_vec)/3,
+  main = "Casual Users Network",
+  layout = layout.fruchterman.reingold
+)
+```
+
+**Figure 8: Sub networks by rideable types** 
+```{r "networks by rideable types", eval=T}
+par(mfrow = c(1,3))
+set.seed(222)
+plot(
+  classic_graph, 
+  vertex.label = NA, 
+  vertex.color = rideable_type_cols[1],
+  edge.arrow.width = 0.8,
+  edge.arrow.size = 0.2,
+  vertex.size = degree(classic_graph, mode = "all", loops = TRUE)/10 + 3,
+  # vertex.size = deg_vec,
+   # vertex.size = sqrt(deg_vec)/3,
+  main = "Classic bike network",
+  layout = layout.fruchterman.reingold
+)
+# legend("bottom", legend = c("Classic bikes", "Docked bikes", "Electric bikes"),
+#            pt.cex=1.5, pt.bg = rideable_type_cols, pch = 21, cex = 0.7, 
+#            bty = "n", ncol = 1)
+
+
+set.seed(222)
+plot(
+  docked_graph, 
+  vertex.label = NA, 
+  vertex.color = rideable_type_cols[2],
+  edge.arrow.width = 0.8,
+  edge.arrow.size = 0.2,
+  vertex.size = degree(docked_graph, mode = "all", loops = TRUE)/10 + 3,
+  # vertex.size = deg_vec,
+   # vertex.size = sqrt(deg_vec)/3,
+  main = "Docked bike network",
+  layout = layout.fruchterman.reingold
+)
+
+set.seed(222)
+plot(
+  electric_graph, 
+  vertex.label = NA, 
+  vertex.color = rideable_type_cols[3],
+  edge.arrow.width = 0.8,
+  edge.arrow.size = 0.2,
+  vertex.size = degree(electric_graph, mode = "all", loops = TRUE)/10 + 3,
+  # vertex.size = deg_vec,
+   # vertex.size = sqrt(deg_vec)/3,
+  main = "Electric bike network",
+  layout = layout.fruchterman.reingold
+)
+
+```
+
+The self-loops represent instances where riders return bikes back to the station where the trip started. This is a most likely phenomenon as depicted by the above networks. Also, there are a lot of isolates in all sub networks.
+
+
+As can be observed from the graphs there are many self-loops. Here, self-loops indicate situations where a bike rider picks up a bike from station A and returns it to the same station, thus an edge moves from station A back to itself. This is a reasonable and possible phenomenon in a bike-sharing system. Therefore, based on the context of my project, I believe strongly that the self-loops provide very useful information. Hence, the main reason why I maintained them in the above graphs. However, the self-loops appear to be too many to the extent that they somehow conceal the true nature of the networks, so in the subsequent graphs for the community detection I simplified the graphs down to remove self-loops and also make them undirected for simplicity. It must be generally understood from here that whenever a node stands in isolation without any edge (connection) going out or coming in, there is at least one bike trip starting from it and ending at that same node.
+
+
+### Analysis of Communinity Structure
+
+**Figure 9: **
+```{r eval=T}
+trip_graph_undirected <- trip_net_df %>%
+        group_by(start_station_name, end_station_name) %>% 
+        summarize(
+                # Set weights as proportion of total trips
+                weights = n()
+        ) %>%
+  graph_from_data_frame(directed = F)
+# trip_graph_undirected <- graph_from_data_frame(trip_net_df2, directed = F)
+trip_graph_undirected <- simplify(trip_graph_undirected)
+
+tripc_fg <- fastgreedy.community(trip_graph_undirected) # trip clusters by fast greedy alg
+# tripc_eb <- edge.betweenness.community(trip_graph_undirected)
+# tripc_le <- leading.eigenvector.community(trip_graph_undirected)
+tripc_cw <- cluster_walktrap(trip_graph_undirected)
+tripc_cl <- cluster_louvain(trip_graph_undirected)
+# membership(tripc_cl)
+# communities(tripc_cl)
+# Determine sizes of each community
+# sizes(tripc_eb)
+
+# Determine which individuals belong to which community
+# membership(kc)
+
+
+# Plot the community structure of the network
+par(mfrow = c(1,2))
+# plot(tripc_fg, trip_graph_undirected, vertex.label = NA)
+# plot(tripc_eb, trip_graph_undirected, vertex.label = NA)
+plot(tripc_cl,
+     trip_graph_undirected,
+     vertex.label = NA,
+     main = "Community structure by \n the Louvain algorithm"
+     )
+plot(tripc_cw, trip_graph_undirected, vertex.label = NA,
+     main = "Community structure by \n the Walktrap algorithm")
+
+# plot(tripc_fg,
+#      trip_graph_undirected,
+#      vertex.label = NA,
+#      main = "Community structure by \n the Louvain algorithm"
+#      )
+```
+
+```{r "membership"}
+lc_membership <- membership(tripc_cl)
+wc_membership <- membership(tripc_cw)
+lc_sizes <- sizes(tripc_cl)
+wc_sizes <- sizes(tripc_cw)
+```
+
+The network communities structure is not much different from what was already observed from the previous graphs. The Louvain algorithm produced 40 communities while the Walktrap algorithm detected 103 communities. These sub groups appear to be too many to be all that useful, however, the communities detected by the Louvain algorithm appears quite reasonable.
+
+
+```{r eval=FALSE}
+wc <- cluster_walktrap(member_trip_graph)
+cl_members <- membership(wc)
+
+# Convert to object suitable for networkD3
+members_trip_d3 <- igraph_to_networkD3(member_trip_graph, group = cl_members)
+
+# Create force directed network plot
+# forceNetwork(Links = members_trip_d3$links, Nodes = members_trip_d3$nodes,
+#              Source = 'source', Target = 'target', 
+#              NodeID = 'name', Group = 'group')
+```
+
+
+```{r "Sankey Network", eval=F}
+stations_link <- tripdata_sample_clean %>%
+  drop_na() %>%
+  select(start_station_id,
+         start_station_name,
+         end_station_id,
+         end_station_name) %>%
+  mutate(same_direction = ifelse(start_station_id == end_station_id, TRUE, FALSE)) %>%
+  filter(ifelse(start_station_id == end_station_id, TRUE, FALSE) == FALSE) %>%
+  count(start_station_name,
+        end_station_name,
+        sort = T,
+        name = "counts") %>%
+  filter(counts > 135) %>%
+  as.data.frame()
+
+
+nodes_df <-
+  data.frame(
+    station_name = c(
+      stations_link$start_station_name,
+      stations_link$end_station_name
+    ) %>%
+      unique()
+  ) 
+
+
+stations_link <- stations_link %>%
+  mutate(
+    source_id = match(start_station_name, nodes_df$station_name) - 1,
+    target_id = match(end_station_name, nodes_df$station_name) - 1
+  )
+
+
+my_color <- 'd3.scaleOrdinal().range(["#555511","#002164","#ffff00","#6b3500","#80b700","#ffbf00","#f0ad00","#fa8400","#002164","#ea4c89","#1f4a53"])'
+
+sankeyNetwork(
+  Links = stations_link,
+  Nodes = nodes_df,
+  Source = "source_id",
+  Target = "target_id",
+  Value = "counts",
+  NodeID = "station_name",
+  sinksRight = T,
+  nodeWidth = 20,
+  fontSize = 12,
+  # colourScale = my_color,
+  nodePadding = 3,
+  units = "TWh"
+)
+
+```
+
+
+# Discussion
+
+## Key Findings and Interpretation
+
+The exploratory data analysis revealed that bike ridership differ significantly between members and casual users and also between bike rideable types. Bike usage fluctuates throughout the day over the weekday as well as the weekend, and the majority of trips occurred. There appeared to be more member users, as expected, than casual users, probably because members of the Divvy bike-share system are residents of the various communities around the Chicago region, while the casual users may likely be visitors. Also, Classic bikes were found to be the most patronized bikes with a 69% share out of the total 455,275 ridership sampled, with docked bikes usage likely to phase out over time. Some anomalies including recorded time lengths and missing information were found. 
+
+The network centrality measures suggested that stations including the Streeter Dr & Grand Avenue, Michigan Ave & Oak St, Wells St & concord Ln, Millennium Park, Clark St & Elm St, Ashland Ave & Division St, among a few others, appear be the central bike-share stations in the Divvy bike-share system. However, the Streeter Dr & Grand Avenue seems to be the most popular station. The results signifies that receives the most in and out trips (based on degree), the State St & 95th St stations is critical for information inflow in the bike-share system (according to betweenness centrality), and again the Streeter Dr & Grand Avenue station lies closer to most of the stations. 
+
+<!-- The closeness centrality did not show much difference as far as the ranking of the stations was concerned.  -->
+
+Moreover, the networks produced from the user type subgrops and rideable type subgroups did not show much significant differences in terms of network structure. This was further assentuated by the community detection analysis. According to the Louvain algorithm and the Walktrap algorithm, the Divvy bike-share system can be divided into 40 communities and 103 communities, respectively, based on a random sample of the data. These sub groups appear to be too many to be of any practical significance, however, the size communities detected by the Louvain algorithm appears quite reasonable. Strong overlaps were observed in all communities produced by the two algorithms. By this, I can say that the Divvy bike-share system appears to consist of one big giant component, suggesting that a homogeneous strategies can be adopted to improve ridership across all or most of the stations.
+
+
+
+## Limitations
+
+First and foremost, the study was largely plagued by limited time constraint. One major setback to the study has to do with the absence of demographic data such as gender and age of the users and weather condition factors such as temperature in the data set. Such information could have been utilized to explain some of the phenomena observed. Another limitation results from the fact that the study did not make use of the geographic location information provided in the data set, once again due to the limited time for the project. Incorporating such spatial information in this project can help Divvy and other communities interested in adopting bike sharing systems to identify potential station locations that will serve the most amount of number of riders. It is also recommended that the Divvy bike-system data recording be validated to ensure accuracy of information.
+
+## Generalisability
+
+Overall, I believe the results generalizes well to the population of bike-share riders in the Chicago metropolitan area. This is because the sampling framework used ensured balanced and representative samples. In spite of this, an analysis of the full one year data obtained might show slightly different results. However, the one caveat is that the findings may not generalize well to other bike-share systems across the United States of America since the data only came from one city, Chicago. So I will say that external validity of the study is compromised. Therefore, as an extension to this project, future studies can consider samples from the various or the four largest bike-share systems, namely Citi Bike (New York city), Divvy (Chicago), Hubway (Greater Boston Area), and Captital Bikeshare (Washington, DC), as was done by Rixey (2013).
+
+# Refernces
+
+- Rixey, R. A. (2013). Station-level forecasting of bikesharing ridership: Station network effects in three US systems. Transportation research record, 2387(1), 46-55.
+
+- Yao, Y., Zhang, Y., Tian, L., Zhou, N., Li, Z., & Wang, M. (2019). Analysis of network structure of urban bike-sharing system: A case study based on real-time data of a public bicycle system. Sustainability, 11(19), 5425.
+
+- Source of data: https://divvy-tripdata.s3.amazonaws.com/index.html https://ride.divvybikes.com/system-data.  Accessed on May 6, 2022.
+
+- Data Description: https://ride.divvybikes.com/system-data.  Accessed on May 6, 2022.
+
+- Data Usage License: https://ride.divvybikes.com/data-license-agreement. Accessed on May 6, 2022.
+
+- The quiet triumph of bike share: https://archive.curbed.com/2019/12/16/20864145/bike-share-citi-bike-jump-uber. Accessed on May 6, 2022.
+
+- Wikipedia (2022). https://en.wikipedia.org/wiki/Divvy. Accessed on May 8, 2022.
+
+- NACTO Bike Share and Shared Micromobility Initiative (2017): https://nacto.org/bike-share-statistics-2017/ Accessed on May 8, 2022.
+
+<!-- - https://www.kaggle.com/code/khsamaha/eda-divvy-bike-sharing-system/report -->
+
+- Network Analysis in R by Dai Shizuka: https://dshizuka.github.io/networkanalysis/tutorials.html
+
+- Centrality measures: https://cambridge-intelligence.com/keylines-faqs-social-network-analysis/
+
+- https://bookdown.org/markhoff/social_network_analysis/your-first-network.html
+
+
+<!-- # Appendix  -->
+
